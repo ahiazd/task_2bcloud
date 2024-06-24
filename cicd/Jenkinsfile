@@ -1,0 +1,73 @@
+pipeline {
+    agent any
+    
+    environment {
+        registryName = "taskdevacr"
+        registryUrl = "taskdevacr.azurecr.io"
+        registryCredential = "ACR"
+        dockerImage = ''
+        aksResourceGroup = 'taskdev-resource' 
+        aksClusterName = 'taskdev-my-aks'     
+        aksNamespace = 'default'             
+        imageTag = "${BUILD_NUMBER}"
+        imageName = "webapp"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scmGit(branches: [[name: '*/main']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/ahiazd/task_2bcloud.git']])
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                     dockerImage = docker.build("${registryUrl}/${imageName}:${imageTag}")
+                }
+            }
+        }
+        
+         stage('Upload Image to ACR') {
+           steps{   
+              script {
+            docker.withRegistry( "https://${registryUrl}", registryCredential ) {
+            dockerImage.push()
+            dockerImage.push("latest")
+            }
+          }
+        }
+     }
+       stage('Deploy to AKS') {
+    steps {
+         withCredentials([azureServicePrincipal('AZURE_CREDENTIALS')]) {
+        script {
+            // Login to Azure
+           sh '''
+                    az login --service-principal \
+                    -u $AZURE_CLIENT_ID \
+                    -p $AZURE_CLIENT_SECRET \
+                    -t $AZURE_TENANT_ID
+                '''
+            // Get AKS credentials
+            sh "az aks get-credentials --resource-group ${aksResourceGroup} --name ${aksClusterName}"
+            
+            // Check if deployment exists, if not create it
+            def deploymentExists = sh(script: "kubectl get deployment ${imageName}-deployment -n ${aksNamespace}", returnStatus: true) == 0
+            if (!deploymentExists) {
+                sh """
+                kubectl create deployment ${imageName}-deployment --image=${registryUrl}/${imageName}:${imageTag} -n ${aksNamespace}
+                kubectl rollout status deployment/${imageName}-deployment -n ${aksNamespace}
+                """
+            } else {
+                sh """
+                kubectl set image deployment/${imageName}-deployment ${imageName}=${registryUrl}/${imageName}:${imageTag} -n ${aksNamespace}
+                kubectl rollout status deployment/${imageName}-deployment -n ${aksNamespace}
+                """
+            }
+        }
+    }    
+ }
+    }
+  }
+}
