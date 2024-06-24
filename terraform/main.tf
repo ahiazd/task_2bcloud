@@ -2,38 +2,45 @@ terraform {
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = ">= 3.0.0" 
+      version = ">= 3.0.0"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = ">= 2.0.0"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = ">= 2.0.0"
     }
   }
 }
 
 provider "azurerm" {
   features {}
-
 }
 
-# region to work on
+
+
 resource "azurerm_resource_group" "taskdev-rg" {
-  name     = "taskdev-resource"
-  location = "France Central"
+  name     = var.resource_group_name
+  location = var.location
   tags = {
     environment = "dev"
   }
 }
 
 resource "azurerm_virtual_network" "taskdev-vn" {
-  name                = "taskdev-virtual-network"
-  resource_group_name = azurerm_resource_group.taskdev-rg.name
-  location            = azurerm_resource_group.taskdev-rg.location
+  name                = var.virtual_network
+  resource_group_name = var.resource_group_name
+  location            = var.location
   address_space       = ["10.123.0.0/16"]
   tags = {
-    enviornment = "dev"
+    environment = "dev"
   }
-
 }
 
 resource "azurerm_subnet" "taskdev-subnet" {
-  name                 = "taskdev-subnet"
+  name                 = var.azurerm_subnet
   resource_group_name  = azurerm_resource_group.taskdev-rg.name
   virtual_network_name = azurerm_virtual_network.taskdev-vn.name
   address_prefixes     = ["10.123.1.0/24"]
@@ -43,7 +50,6 @@ resource "azurerm_network_security_group" "taskdev-sg" {
   name                = "taskdev-sg"
   location            = azurerm_resource_group.taskdev-rg.location
   resource_group_name = azurerm_resource_group.taskdev-rg.name
-
   tags = {
     environment = "dev"
   }
@@ -73,7 +79,6 @@ resource "azurerm_public_ip" "taskdev-ip" {
   resource_group_name = azurerm_resource_group.taskdev-rg.name
   location            = azurerm_resource_group.taskdev-rg.location
   allocation_method   = "Dynamic"
-
   tags = {
     environment = "dev"
   }
@@ -83,21 +88,19 @@ resource "azurerm_network_interface" "taskdev-net-int" {
   name                = "taskdev-network-int"
   location            = azurerm_resource_group.taskdev-rg.location
   resource_group_name = azurerm_resource_group.taskdev-rg.name
-
   ip_configuration {
     name                          = "internal"
     subnet_id                     = azurerm_subnet.taskdev-subnet.id
     private_ip_address_allocation = "Dynamic"
     public_ip_address_id          = azurerm_public_ip.taskdev-ip.id
   }
-
   tags = {
-    enviornment = "dev"
+    environment = "dev"
   }
 }
 
 # Add your SSH public key here
-resource "azurerm_linux_virtual_machine" "taskdev_vm" {
+resource "azurerm_linux_virtual_machine" "taskdev-vm" {
   name                = "taskdev-vm"
   resource_group_name = azurerm_resource_group.taskdev-rg.name
   location            = azurerm_resource_group.taskdev-rg.location
@@ -129,9 +132,23 @@ resource "azurerm_linux_virtual_machine" "taskdev_vm" {
     environment = "dev"
   }
 
+}
+
+data "azurerm_public_ip" "taskdev-ip" {
+  name                = azurerm_public_ip.taskdev-ip.name
+  resource_group_name = azurerm_resource_group.taskdev-rg.name
+}
+
+resource "null_resource" "wait_for_ip" {
+  depends_on = [azurerm_linux_virtual_machine.taskdev-vm]
+
+  provisioner "local-exec" {
+    command = "echo ${data.azurerm_public_ip.taskdev-ip.ip_address}"
+  }
+//Jenkins installation with docker and git
   provisioner "remote-exec" {
     inline = [
-       "sudo apt-get update",
+      "sudo apt-get update",
       "sudo apt-get install -y docker.io git",
       "sudo systemctl start docker",
       "sudo systemctl enable docker",
@@ -146,48 +163,89 @@ resource "azurerm_linux_virtual_machine" "taskdev_vm" {
       "sudo systemctl start jenkins",
       "sudo systemctl enable jenkins"
     ]
-
+//kry pair i crated to connect to VM
     connection {
       type        = "ssh"
       user        = "adminuser"
       private_key = file("azure_key")
-      host        = azurerm_public_ip.taskdev-ip.ip_address
+      host        = data.azurerm_public_ip.taskdev-ip.ip_address
     }
   }
 }
 
-# Create an Azure Container Registry (ACR)
-resource "azurerm_container_registry" "acr" {
-  name                = "taskdevacr"
-  resource_group_name = azurerm_resource_group.taskdev-rg.name
-  location            = azurerm_resource_group.taskdev-rg.location
-  sku                 = "Standard"
-  admin_enabled       = true
+
+
+data "azurerm_client_config" "current" {}
+resource "azurerm_key_vault" "taskdev_key_vault" {
+  name                       = var.azurerm_key_vault
+  location                   = var.location
+  resource_group_name        = var.resource_group_name
+  tenant_id                  = data.azurerm_client_config.current.tenant_id
+  sku_name                   = "standard"
+  soft_delete_retention_days = 7
+
+  access_policy {
+    tenant_id = data.azurerm_client_config.current.tenant_id
+    object_id = data.azurerm_client_config.current.object_id
+
+    key_permissions = [
+      "Create",
+      "Get",
+    ]
+
+    secret_permissions = [
+      "Set",
+      "Get",
+      "Delete",
+      "Purge",
+      "Recover"
+    ]
+  }
 }
 
+resource "azurerm_role_assignment" "role_acrpull" {
+  scope                            = azurerm_container_registry.acr.id
+  role_definition_name             = "AcrPull"
+  principal_id                     = azurerm_kubernetes_cluster.aks.kubelet_identity.0.object_id
+  skip_service_principal_aad_check = true
+}
 
-# Create an AKS cluster
-resource "azurerm_kubernetes_cluster" "taskdev-k8s-cluster" {
-  name                = "taskdev-k8s-cls"
-  location            = azurerm_resource_group.taskdev-rg.location
-  resource_group_name = azurerm_resource_group.taskdev-rg.name
-  dns_prefix          = "deveks"
+resource "azurerm_container_registry" "acr" {
+  name                = var.acr_name
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  sku                 = "Standard"
+  admin_enabled       = false
+}
+
+resource "azurerm_kubernetes_cluster" "aks" {
+  name                = var.cluster_name
+  kubernetes_version  = var.kubernetes_version
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  dns_prefix          = var.cluster_name
 
   default_node_pool {
-    name       = "default"
-    node_count = 1
-    vm_size    = "Standard_D2_v2"
+    name                = "system"
+    node_count          = var.system_node_count
+    vm_size             = "Standard_DS2_v2"
+    type                = "VirtualMachineScaleSets"
+    zones               = [1, 2, 3]
+    enable_auto_scaling = false
   }
 
   identity {
     type = "SystemAssigned"
   }
-  
- tags = {
-    Environment = "dev"
+
+  network_profile {
+    load_balancer_sku = "standard"
+    network_plugin    = "kubenet"
   }
- 
 }
 
-
-
+resource "local_file" "kubeconfig" {
+  depends_on = [azurerm_kubernetes_cluster.aks]
+  filename   = "kubeconfig"
+  content    = azurerm_kubernetes_cluster.aks.kube_config_raw
+}
